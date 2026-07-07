@@ -18,6 +18,7 @@ from PySide6.QtGui import *
 import configparser
 import pandas as pd
 from pathlib import Path
+import struct
 
 # ===== 导入你的 Modbus 模块 =====
 from modbus_tcp import tcp_connect, tcp_recv
@@ -81,17 +82,231 @@ class LogRedirector(QTextEdit):
         return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
-# ===== Modbus 管理器（适配你的项目）=====
+# ===== 数据解析工具类 =====
+class ModbusDataParser:
+    """Modbus响应数据解析器"""
+    
+    @staticmethod
+    def parse_bit_data(data_bytes, start_bit=0, bit_count=None, byte_order='ABCD'):
+        """解析位数据（线圈/离散输入/寄存器值的位）"""
+        if not data_bytes:
+            return []
+        
+        if len(data_bytes) == 2 and byte_order in ['BADC', 'CDAB', 'DCBA']:
+            data_bytes = bytes([data_bytes[1], data_bytes[0]])
+        
+        if bit_count is None:
+            bit_count = len(data_bytes) * 8
+        
+        results = []
+        bit_index = 0
+        for byte_idx, byte_val in enumerate(data_bytes):
+            for bit_pos in range(8):
+                if bit_index >= bit_count:
+                    break
+                if bit_index >= start_bit:
+                    val = (byte_val >> bit_pos) & 1
+                    results.append({
+                        'index': bit_index,
+                        'byte': byte_idx,
+                        'bit': bit_pos,
+                        'value': val,
+                        'display': 'ON' if val else 'OFF',
+                        'byte_hex': f'{byte_val:02X}'
+                    })
+                bit_index += 1
+            if bit_index >= bit_count:
+                break
+        return results
+    
+    @staticmethod
+    def parse_register_data(data_bytes, data_type='UINT16', byte_order='ABCD', start_index=0, count=None):
+        """解析寄存器数据"""
+        if not data_bytes:
+            return []
+        
+        order_map = {
+            'ABCD': lambda x: x,
+            'BADC': lambda x: bytes([x[1], x[0], x[3], x[2]]) if len(x) >= 4 else x,
+            'CDAB': lambda x: bytes([x[2], x[3], x[0], x[1]]) if len(x) >= 4 else x,
+            'DCBA': lambda x: bytes([x[3], x[2], x[1], x[0]]) if len(x) >= 4 else x,
+        }
+        
+        type_map = {
+            'UINT16': ('H', 2, False),
+            'INT16': ('h', 2, False),
+            'UINT32': ('I', 4, False),
+            'INT32': ('i', 4, False),
+            'FLOAT': ('f', 4, False),
+            'BIT': (None, 2, True),
+        }
+        
+        if data_type not in type_map:
+            data_type = 'UINT16'
+        
+        fmt, bytes_per_reg, is_bit = type_map[data_type]
+        
+        if count is None:
+            if data_type in ['UINT16', 'INT16']:
+                count = len(data_bytes) // 2
+            else:
+                count = len(data_bytes) // bytes_per_reg
+        
+        if len(data_bytes) == 2 and count == 0:
+            count = 1
+        
+        results = []
+        pos = 0
+        
+        for i in range(count):
+            if pos + bytes_per_reg > len(data_bytes):
+                break
+            
+            chunk = data_bytes[pos:pos + bytes_per_reg]
+            
+            if byte_order in order_map:
+                chunk = order_map[byte_order](chunk)
+            
+            if is_bit:
+                reg_val = (chunk[0] << 8) | chunk[1]
+                for bit_pos in range(16):
+                    bit_val = (reg_val >> bit_pos) & 1
+                    results.append({
+                        'index': i * 16 + bit_pos,
+                        'register': i,
+                        'bit': bit_pos,
+                        'value': bit_val,
+                        'display': 'ON' if bit_val else 'OFF',
+                        'type': 'BIT'
+                    })
+            else:
+                try:
+                    if len(chunk) < bytes_per_reg:
+                        chunk = chunk + b'\x00' * (bytes_per_reg - len(chunk))
+                    val = struct.unpack('>' + fmt, chunk)[0]
+                    results.append({
+                        'index': i,
+                        'value': val,
+                        'display': str(val),
+                        'type': data_type,
+                        'hex': ' '.join([f'{b:02X}' for b in chunk])
+                    })
+                except:
+                    results.append({
+                        'index': i,
+                        'value': None,
+                        'display': '解析错误',
+                        'type': data_type,
+                        'hex': ' '.join([f'{b:02X}' for b in chunk])
+                    })
+            
+            pos += bytes_per_reg
+        
+        return results
+    
+    @staticmethod
+    def parse_response_full(response_bytes, is_rtu=True):
+        """解析完整响应报文，提取PDU和数据"""
+        if not response_bytes:
+            return None, None
+        
+        if is_rtu:
+            if len(response_bytes) < 4:
+                return None, None
+            pdu = response_bytes[1:-2]
+            if len(pdu) < 2:
+                return None, None
+            func_code = pdu[0]
+            if func_code & 0x80:
+                error_code = pdu[1] if len(pdu) > 1 else 0
+                error_msg = {
+                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
+                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
+                    8: '存储奇偶校验错误', 10: '不可用网关路径',
+                    11: '网关目标设备无响应'
+                }.get(error_code, f'未知错误(0x{error_code:02X})')
+                return pdu, {'error': True, 'func_code': func_code, 'error_code': error_code, 'message': error_msg}
+            
+            if func_code in [5, 6, 15, 16]:
+                data_bytes = b''
+            elif func_code in [3, 4]:
+                if len(pdu) >= 2:
+                    byte_count = pdu[1]
+                    data_bytes = pdu[2:2+byte_count] if byte_count > 0 else b''
+                else:
+                    data_bytes = b''
+            elif func_code in [1, 2]:
+                if len(pdu) >= 2:
+                    byte_count = pdu[1]
+                    data_bytes = pdu[2:2+byte_count] if byte_count > 0 else b''
+                else:
+                    data_bytes = b''
+            else:
+                data_bytes = b''
+            
+            return pdu, {
+                'func_code': func_code,
+                'byte_count': len(data_bytes),
+                'data_bytes': data_bytes,
+                'error': False
+            }
+        
+        else:  # TCP
+            if len(response_bytes) < 8:
+                return None, None
+            pdu = response_bytes[6:]
+            if len(pdu) < 2:
+                return None, None
+            
+            unit_id = pdu[0]
+            func_code = pdu[1]
+            
+            if func_code & 0x80:
+                error_code = pdu[2] if len(pdu) > 2 else 0
+                error_msg = {
+                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
+                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
+                    8: '存储奇偶校验错误', 10: '不可用网关路径',
+                    11: '网关目标设备无响应'
+                }.get(error_code, f'未知错误(0x{error_code:02X})')
+                return pdu, {'error': True, 'func_code': func_code, 'error_code': error_code, 'message': error_msg}
+            
+            if func_code in [5, 6, 15, 16]:
+                data_bytes = b''
+            elif func_code in [3, 4]:
+                if len(pdu) >= 3:
+                    byte_count = pdu[2]
+                    data_bytes = pdu[3:3+byte_count] if byte_count > 0 else b''
+                else:
+                    data_bytes = b''
+            elif func_code in [1, 2]:
+                if len(pdu) >= 3:
+                    byte_count = pdu[2]
+                    data_bytes = pdu[3:3+byte_count] if byte_count > 0 else b''
+                else:
+                    data_bytes = b''
+            else:
+                data_bytes = b''
+            
+            return pdu, {
+                'func_code': func_code,
+                'byte_count': len(data_bytes),
+                'data_bytes': data_bytes,
+                'error': False,
+                'unit_id': unit_id
+            }
+
+
+# ===== Modbus 管理器 =====
 class ModbusManager:
     def __init__(self):
         self.connection = None
         self.protocol = None
         self.is_connected = False
         self.connection_params = {}
-        self.timeout = 3  # 秒
+        self.timeout = 3
         self.log_callback = None
     
-    # ---- 连接管理 ----
     def connect_tcp(self, host='127.0.0.1', port=502):
         try:
             port = int(port)
@@ -149,9 +364,7 @@ class ModbusManager:
         except Exception as e:
             self._log_to_gui(f"断开失败: {e}", "ERROR")
     
-    # ---- 核心收发 ----
     def _send_raw(self, raw_bytes):
-        """发送原始字节"""
         if self.protocol == 'tcp':
             try:
                 self.connection.send(raw_bytes)
@@ -159,7 +372,7 @@ class ModbusManager:
             except Exception as e:
                 self._log_to_gui(f"TCP发送失败: {e}", "ERROR")
                 return False
-        else:  # RTU
+        else:
             try:
                 bytes_written = self.connection.write(raw_bytes)
                 self._log_to_gui(f"实际发送字节数: {bytes_written}", "DEBUG")
@@ -169,49 +382,45 @@ class ModbusManager:
                 return False
     
     def _recv(self):
-        """接收响应"""
         if self.protocol == 'tcp':
             try:
                 return tcp_recv(self.connection, int(self.timeout * 1000))
             except Exception as e:
                 self._log_to_gui(f"TCP接收异常: {e}", "DEBUG")
                 return None
-        else:  # RTU
+        else:
             try:
                 return rtu_recv(self.connection, int(self.timeout * 1000))
             except Exception as e:
                 self._log_to_gui(f"RTU接收异常: {e}", "DEBUG")
                 return None
     
-    # ---- 高层接口 ----
-    def read(self, slave_id, address, count, function_code):
-        """执行读取"""
+    def read(self, slave_id, address, count, function_code, data_type='UINT16', byte_order='ABCD'):
         if not self.is_connected:
             self._log_to_gui("未连接设备", "WARNING")
             return None
         
         try:
-            # build_single_message 已经包含CRC（RTU）或返回PDU（TCP）
-            request = build_single_message(
+            pdu = build_single_message(
                 addr=slave_id,
                 func=function_code,
                 start=address,
                 num=count
             )
             
-            # TCP需要添加MBAP头
             if self.protocol == 'tcp':
                 transaction_id = int(time.time() * 1000) % 65535
                 tcp_request = bytearray()
                 tcp_request.append((transaction_id >> 8) & 0xFF)
                 tcp_request.append(transaction_id & 0xFF)
-                tcp_request.append(0x00)  # 协议ID高字节
-                tcp_request.append(0x00)  # 协议ID低字节
-                tcp_request.append(0x00)  # 长度高字节
-                tcp_request.append(len(request) + 1)  # 长度低字节（单元ID+PDU）
-                tcp_request.append(slave_id)  # 单元ID
-                tcp_request.extend(request)  # PDU
+                tcp_request.append(0x00)
+                tcp_request.append(0x00)
+                tcp_request.append(0x00)
+                tcp_request.append(len(pdu))
+                tcp_request.extend(pdu)
                 request = bytes(tcp_request)
+            else:
+                request = pdu
             
             self._log_to_gui(f"发送: {format_hex_bytes(request)}", "SEND")
             
@@ -225,64 +434,89 @@ class ModbusManager:
             
             self._log_to_gui(f"接收: {format_hex_bytes(response)}", "RECV")
             
-            # 提取PDU进行解析
+            # 提取PDU - TCP和RTU不同
             if self.protocol == 'tcp':
-                # TCP响应: MBAP头(6) + PDU
                 if len(response) > 6:
-                    pdu = response[6:]
+                    pdu_response = response[6:]
                 else:
                     self._log_to_gui("响应太短", "ERROR")
                     return None
-            else:
-                # RTU响应: 地址(1) + PDU + CRC(2)
+                # TCP: [单元ID] [功能码] [字节数] [数据...]
+                func_idx = 1
+                byte_count_idx = 2
+                data_start_idx = 3
+            else:  # RTU
                 if len(response) > 3:
-                    pdu = response[1:-2]  # 去掉地址和CRC
+                    pdu_response = response[1:-2]
                 else:
                     self._log_to_gui("响应太短", "ERROR")
                     return None
+                # RTU: [功能码] [字节数] [数据...]
+                func_idx = 0
+                byte_count_idx = 1
+                data_start_idx = 2
             
-            # 检查错误
-            error_msg = check_error_response(pdu)
-            if error_msg:
-                self._log_to_gui(f"错误: {error_msg}", "ERROR")
-                return None
-            
-            # 解析数据
-            if len(pdu) < 3:
+            if len(pdu_response) < 3:
                 self._log_to_gui("PDU太短", "ERROR")
                 return None
             
-            byte_count = pdu[2]
-            data_bytes = pdu[3:3+byte_count]
+            resp_func_code = pdu_response[func_idx]
             
-            if function_code in [1, 2, 5, 15]:
+            # 检查错误响应
+            if resp_func_code & 0x80:
+                error_code = pdu_response[func_idx + 1] if len(pdu_response) > func_idx + 1 else 0
+                error_msgs = {
+                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
+                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
+                    8: '存储奇偶校验错误', 10: '不可用网关路径',
+                    11: '网关目标设备无响应'
+                }
+                error_msg = error_msgs.get(error_code, f'未知错误(0x{error_code:02X})')
+                self._log_to_gui(f"错误: 0x{resp_func_code:02X} 错误码: 0x{error_code:02X} ({error_msg})", "ERROR")
+                return None
+            
+            byte_count = pdu_response[byte_count_idx]
+            data_bytes = pdu_response[data_start_idx:data_start_idx + byte_count]
+            
+            self._log_to_gui(f"数据字节: {format_hex_bytes(data_bytes)}", "DEBUG")
+            
+            if function_code in [1, 2]:
                 result = parse_bit_response(data_bytes, "", count)
+                if result:
+                    values = [val for _, val in result]
+                    self._log_to_gui(f"结果: {values}", "RESULT")
+                    return values
+                return []
             else:
-                result = parse_register_response(data_bytes, "", 'UINT16', 'ABCD')
-            
-            if result is not None:
-                self._log_to_gui(f"结果: {result}", "RESULT")
-            return result
+                result = parse_register_response(data_bytes, "", data_type, byte_order)
+                if result:
+                    values = []
+                    for item in result:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            values.append(item[1])
+                        else:
+                            values.append(item)
+                    self._log_to_gui(f"结果: {values}", "RESULT")
+                    return values
+                return []
             
         except Exception as e:
             self._log_to_gui(f"读取失败: {e}", "ERROR")
             return None
     
     def write(self, slave_id, address, values, function_code):
-        """执行写入"""
         if not self.is_connected:
             self._log_to_gui("未连接设备", "WARNING")
             return False
         
         try:
-            request = build_single_message(
+            pdu = build_single_message(
                 addr=slave_id,
                 func=function_code,
                 start=address,
                 num=values
             )
             
-            # TCP需要添加MBAP头
             if self.protocol == 'tcp':
                 transaction_id = int(time.time() * 1000) % 65535
                 tcp_request = bytearray()
@@ -291,10 +525,11 @@ class ModbusManager:
                 tcp_request.append(0x00)
                 tcp_request.append(0x00)
                 tcp_request.append(0x00)
-                tcp_request.append(len(request) + 1)
-                tcp_request.append(slave_id)
-                tcp_request.extend(request)
+                tcp_request.append(len(pdu))
+                tcp_request.extend(pdu)
                 request = bytes(tcp_request)
+            else:
+                request = pdu
             
             self._log_to_gui(f"写入: {format_hex_bytes(request)}", "SEND")
             
@@ -308,21 +543,34 @@ class ModbusManager:
             
             self._log_to_gui(f"响应: {format_hex_bytes(response)}", "RECV")
             
-            # 提取PDU
             if self.protocol == 'tcp':
                 if len(response) > 6:
-                    pdu = response[6:]
+                    pdu_response = response[6:]
                 else:
                     return False
+                func_idx = 1
             else:
                 if len(response) > 3:
-                    pdu = response[1:-2]
+                    pdu_response = response[1:-2]
                 else:
                     return False
+                func_idx = 0
             
-            error_msg = check_error_response(pdu)
-            if error_msg:
-                self._log_to_gui(f"错误: {error_msg}", "ERROR")
+            if len(pdu_response) < 2:
+                return False
+            
+            resp_func_code = pdu_response[func_idx]
+            
+            if resp_func_code & 0x80:
+                error_code = pdu_response[func_idx + 1] if len(pdu_response) > func_idx + 1 else 0
+                error_msgs = {
+                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
+                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
+                    8: '存储奇偶校验错误', 10: '不可用网关路径',
+                    11: '网关目标设备无响应'
+                }
+                error_msg = error_msgs.get(error_code, f'未知错误(0x{error_code:02X})')
+                self._log_to_gui(f"错误: 0x{resp_func_code:02X} 错误码: 0x{error_code:02X} ({error_msg})", "ERROR")
                 return False
             
             return True
@@ -332,46 +580,32 @@ class ModbusManager:
             return False
     
     def send_raw_and_receive(self, raw_bytes):
-        """发送原始报文（手动模式）- 修复TCP组帧"""
         if not self.is_connected:
             self._log_to_gui("未连接设备", "WARNING")
             return None
         
         try:
-            # TCP模式：添加MBAP头
             if self.protocol == 'tcp':
-                # 更严格的MBAP头检测：
-                # 1. 长度至少为7字节
-                # 2. 第3-4字节为0x0000（协议ID）
-                # 3. 第5-6字节为长度，且长度值 + 6 == 总长度
                 is_full_tcp = False
                 if len(raw_bytes) >= 7:
                     protocol_id = (raw_bytes[2] << 8) | raw_bytes[3]
                     length = (raw_bytes[4] << 8) | raw_bytes[5]
-                    # 协议ID必须为0，且长度字段必须匹配
                     if protocol_id == 0 and (length + 6) == len(raw_bytes):
                         is_full_tcp = True
                 
                 if not is_full_tcp:
                     transaction_id = int(time.time() * 1000) % 65535
-                    # 构建完整TCP报文
                     tcp_packet = bytearray()
-                    # 事务ID
                     tcp_packet.append((transaction_id >> 8) & 0xFF)
                     tcp_packet.append(transaction_id & 0xFF)
-                    # 协议ID (固定0x0000)
                     tcp_packet.append(0x00)
                     tcp_packet.append(0x00)
-                    # 长度 = PDU的长度
                     pdu_length = len(raw_bytes)
                     tcp_packet.append((pdu_length >> 8) & 0xFF)
                     tcp_packet.append(pdu_length & 0xFF)
-                    # PDU
                     tcp_packet.extend(raw_bytes)
                     raw_bytes = bytes(tcp_packet)
                     self._log_to_gui(f"添加MBAP头: {format_hex_bytes(raw_bytes)}", "DEBUG")
-                else:
-                    self._log_to_gui(f"已包含MBAP头: {format_hex_bytes(raw_bytes)}", "DEBUG")
             
             self._log_to_gui(f"发送原始: {format_hex_bytes(raw_bytes)}", "SEND")
             
@@ -410,7 +644,7 @@ class ModbusGUI(QMainWindow):
     
     def init_ui(self):
         self.setWindowTitle("Modbus GUI 测试工具")
-        self.setGeometry(100, 100, 1100, 800)
+        self.setGeometry(100, 100, 1200, 900)
         self.setStyleSheet("""
             QMainWindow { background-color: #2d2d2d; }
             QGroupBox { color: #d4d4d4; border: 1px solid #3c3c3c; border-radius: 5px; margin-top: 10px; font-weight: bold; padding-top: 10px; }
@@ -419,12 +653,13 @@ class ModbusGUI(QMainWindow):
             QPushButton { background-color: #0e639c; color: white; border: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; }
             QPushButton:hover { background-color: #1177bb; }
             QPushButton:disabled { background-color: #3c3c3c; color: #808080; }
-            QLineEdit, QSpinBox, QComboBox { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555555; border-radius: 3px; padding: 5px; }
+            QLineEdit, QSpinBox, QComboBox, QTextEdit { background-color: #3c3c3c; color: #d4d4d4; border: 1px solid #555555; border-radius: 3px; padding: 5px; }
             QTabWidget::pane { border: 1px solid #3c3c3c; background-color: #2d2d2d; }
             QTabBar::tab { background-color: #3c3c3c; color: #d4d4d4; padding: 8px 15px; margin-right: 2px; }
             QTabBar::tab:selected { background-color: #0e639c; }
             QTableWidget { background-color: #1e1e1e; color: #d4d4d4; gridline-color: #3c3c3c; }
             QHeaderView::section { background-color: #3c3c3c; color: #d4d4d4; padding: 4px; }
+            QTextEdit { font-family: Consolas, monospace; }
         """)
         
         central = QWidget()
@@ -520,8 +755,8 @@ class ModbusGUI(QMainWindow):
         batch_layout.addLayout(file_layout)
         
         self.table_widget = QTableWidget()
-        self.table_widget.setColumnCount(6)
-        self.table_widget.setHorizontalHeaderLabels(["从站ID", "功能码", "地址", "数量/数据", "期望值", "状态"])
+        self.table_widget.setColumnCount(9)
+        self.table_widget.setHorizontalHeaderLabels(["用例编号", "设备地址", "功能码", "起始地址", "寄存器数量", "数据类型", "字节顺序", "读取结果", "状态"])
         batch_layout.addWidget(self.table_widget)
         
         step_layout = QHBoxLayout()
@@ -567,7 +802,7 @@ class ModbusGUI(QMainWindow):
         param_layout.addWidget(self.manual_addr, 0, 5)
         param_layout.addWidget(QLabel("数量/数据:"), 0, 6)
         self.manual_qty = QLineEdit()
-        self.manual_qty.setPlaceholderText("读:数量, 写:1,2,3")
+        self.manual_qty.setPlaceholderText("读:数量, 写:1,2,3 或 3.14,2.71")
         param_layout.addWidget(self.manual_qty, 0, 7)
         param_group.setLayout(param_layout)
         manual_layout.addWidget(param_group)
@@ -593,19 +828,58 @@ class ModbusGUI(QMainWindow):
         raw_group.setLayout(raw_layout)
         manual_layout.addWidget(raw_group)
         
-        resp_group = QGroupBox("响应")
+        resp_group = QGroupBox("响应报文与数据解析")
         resp_layout = QVBoxLayout()
-        self.manual_response = QTextEdit()
+        
+        resp_display_layout = QHBoxLayout()
+        resp_display_layout.addWidget(QLabel("响应:"))
+        self.manual_response = QLineEdit()
         self.manual_response.setReadOnly(True)
-        self.manual_response.setMaximumHeight(80)
-        resp_layout.addWidget(self.manual_response)
+        self.manual_response.setPlaceholderText("发送后显示响应报文")
+        resp_display_layout.addWidget(self.manual_response)
+        resp_layout.addLayout(resp_display_layout)
+        
+        parse_layout = QGridLayout()
+        parse_layout.addWidget(QLabel("数据类型:"), 0, 0)
+        self.parse_type_combo = QComboBox()
+        self.parse_type_combo.addItems(["BIT", "UINT16", "INT16", "UINT32", "INT32", "FLOAT"])
+        parse_layout.addWidget(self.parse_type_combo, 0, 1)
+        
+        parse_layout.addWidget(QLabel("字节顺序:"), 0, 2)
+        self.parse_order_combo = QComboBox()
+        self.parse_order_combo.addItems(["ABCD", "BADC", "CDAB", "DCBA"])
+        parse_layout.addWidget(self.parse_order_combo, 0, 3)
+        
+        parse_layout.addWidget(QLabel("起始位/索引:"), 0, 4)
+        self.parse_start = QSpinBox()
+        self.parse_start.setRange(0, 9999)
+        self.parse_start.setValue(0)
+        parse_layout.addWidget(self.parse_start, 0, 5)
+        
+        parse_layout.addWidget(QLabel("数量:"), 0, 6)
+        self.parse_count = QSpinBox()
+        self.parse_count.setRange(1, 9999)
+        self.parse_count.setValue(16)
+        parse_layout.addWidget(self.parse_count, 0, 7)
+        
+        self.parse_btn = QPushButton("解析数据")
+        self.parse_btn.clicked.connect(self.parse_response_data)
+        parse_layout.addWidget(self.parse_btn, 0, 8)
+        
+        resp_layout.addLayout(parse_layout)
+        
+        self.parse_result_text = QTextEdit()
+        self.parse_result_text.setReadOnly(True)
+        self.parse_result_text.setMaximumHeight(200)
+        self.parse_result_text.setPlaceholderText("解析结果将显示在这里")
+        resp_layout.addWidget(self.parse_result_text)
+        
         resp_group.setLayout(resp_layout)
         manual_layout.addWidget(resp_group)
         
         self.tab_widget.addTab(tab_manual, "手动发送")
         main_layout.addWidget(self.tab_widget)
         
-        # ---- 日志 ----
         log_group = QGroupBox("日志")
         log_layout = QVBoxLayout()
         log_toolbar = QHBoxLayout()
@@ -633,10 +907,10 @@ class ModbusGUI(QMainWindow):
         
         self.on_protocol_changed("TCP")
         self.log_display.append_log("Modbus GUI 测试工具启动成功", "SUCCESS")
+        self.log_display.append_log("支持BIT/UINT16/INT16/UINT32/INT32/FLOAT数据解析", "INFO")
     
     # ---- 辅助方法 ----
     def on_protocol_changed(self, protocol):
-        """切换协议时自动断开连接"""
         if self.modbus_manager.is_connected:
             self.modbus_manager.disconnect()
             self.connect_btn.setText("连接")
@@ -735,7 +1009,7 @@ class ModbusGUI(QMainWindow):
             return
         try:
             self.excel_df = pd.read_excel(file_path)
-            required = ['slave_id', 'func_code', 'address', 'quantity_or_data']
+            required = ['用例编号', '设备地址', '功能码', '起始地址', '寄存器数量']
             for col in required:
                 if col not in self.excel_df.columns:
                     self.log_display.append_log(f"缺少列: {col}", "ERROR")
@@ -756,12 +1030,15 @@ class ModbusGUI(QMainWindow):
             return
         self.table_widget.setRowCount(len(self.excel_df))
         for i, row in self.excel_df.iterrows():
-            self.table_widget.setItem(i, 0, QTableWidgetItem(str(row.get('slave_id', ''))))
-            self.table_widget.setItem(i, 1, QTableWidgetItem(str(row.get('func_code', ''))))
-            self.table_widget.setItem(i, 2, QTableWidgetItem(str(row.get('address', ''))))
-            self.table_widget.setItem(i, 3, QTableWidgetItem(str(row.get('quantity_or_data', ''))))
-            self.table_widget.setItem(i, 4, QTableWidgetItem(str(row.get('expect_value', ''))))
-            self.table_widget.setItem(i, 5, QTableWidgetItem("待执行"))
+            self.table_widget.setItem(i, 0, QTableWidgetItem(str(row.get('用例编号', ''))))
+            self.table_widget.setItem(i, 1, QTableWidgetItem(str(row.get('设备地址', ''))))
+            self.table_widget.setItem(i, 2, QTableWidgetItem(str(row.get('功能码', ''))))
+            self.table_widget.setItem(i, 3, QTableWidgetItem(str(row.get('起始地址', ''))))
+            self.table_widget.setItem(i, 4, QTableWidgetItem(str(row.get('寄存器数量', ''))))
+            self.table_widget.setItem(i, 5, QTableWidgetItem(str(row.get('数据类型', ''))))
+            self.table_widget.setItem(i, 6, QTableWidgetItem(str(row.get('字节顺序', ''))))
+            self.table_widget.setItem(i, 7, QTableWidgetItem(""))  # 读取结果列，初始为空
+            self.table_widget.setItem(i, 8, QTableWidgetItem("待执行"))
         self.table_widget.resizeColumnsToContents()
     
     def next_row(self):
@@ -776,49 +1053,158 @@ class ModbusGUI(QMainWindow):
             self.row_info_label.setText(f"第 {self.current_row_index+1}/{len(self.excel_df)} 行")
             self.table_widget.selectRow(self.current_row_index)
     
+    def _format_result_for_display(self, result, data_type, byte_order, bit_names, desc):
+        """格式化结果用于显示 - 带描述信息，全部显示不截断"""
+        if result is None:
+            return "无数据"
+        
+        if not isinstance(result, list):
+            return str(result)
+        
+        if len(result) == 0:
+            return "空"
+        
+        # BIT类型 - 使用位名称，全部显示
+        if data_type.upper() == 'BIT':
+            bit_names_list = [n.strip() for n in bit_names.split(',') if n.strip()]
+            lines = []
+            for i, val in enumerate(result):
+                if i < len(bit_names_list) and bit_names_list[i]:
+                    lines.append(f"{bit_names_list[i]}={'ON' if val else 'OFF'}")
+                else:
+                    lines.append(f"位{i}={'ON' if val else 'OFF'}")
+            return '; '.join(lines)
+        
+        # 寄存器类型 - 使用寄存器描述
+        desc_list = [d.strip() for d in desc.split(',') if d.strip()]
+        
+        try:
+            if data_type.upper() == 'FLOAT':
+                if desc_list:
+                    lines = []
+                    for i, v in enumerate(result):
+                        if i < len(desc_list) and desc_list[i]:
+                            try:
+                                lines.append(f"{desc_list[i]}: {float(v):.2f}")
+                            except (ValueError, TypeError):
+                                lines.append(f"{desc_list[i]}: {v}")
+                        else:
+                            try:
+                                lines.append(f"寄存器{i}: {float(v):.2f}")
+                            except (ValueError, TypeError):
+                                lines.append(f"寄存器{i}: {v}")
+                    return '; '.join(lines)
+                else:
+                    formatted = []
+                    for v in result:
+                        try:
+                            formatted.append(f"{float(v):.2f}")
+                        except (ValueError, TypeError):
+                            formatted.append(str(v))
+                    return ', '.join(formatted)
+            else:
+                if desc_list:
+                    lines = []
+                    for i, v in enumerate(result):
+                        if i < len(desc_list) and desc_list[i]:
+                            lines.append(f"{desc_list[i]}: {v}")
+                        else:
+                            lines.append(f"寄存器{i}: {v}")
+                    return '; '.join(lines)
+                else:
+                    return ', '.join([str(v) for v in result])
+        except Exception as e:
+            return f"解析错误: {e}"
+    
     def run_current_row(self):
+        """执行当前行 - 根据Excel模板解析"""
         if self.excel_df is None or not self.modbus_manager.is_connected:
             self.log_display.append_log("请先连接并加载数据", "WARNING")
             return
         try:
             row = self.excel_df.iloc[self.current_row_index]
-            slave = int(row.get('slave_id', 1))
-            func = int(row.get('func_code', 3))
-            addr = int(row.get('address', 0))
-            qty = row.get('quantity_or_data', 10)
+            slave = int(row.get('设备地址', 1))
+            func = int(row.get('功能码', 3))
+            addr = int(row.get('起始地址', 0))
+            quantity = int(row.get('寄存器数量', 1))
+            data_type = str(row.get('数据类型', 'UINT16')).strip()
+            byte_order = str(row.get('字节顺序', 'ABCD')).strip()
+            bit_names = str(row.get('位名称', '')).strip()
+            desc = str(row.get('寄存器描述', '')).strip()
             
-            if func in [1, 2, 3, 4]:
-                result = self.modbus_manager.read(slave, addr, int(qty), func)
-                status = "成功" if result is not None else "失败"
-            else:
-                if isinstance(qty, str) and ',' in qty:
-                    values = [int(v.strip()) for v in qty.split(',')]
+            is_read = func in [1, 2, 3, 4]
+            
+            self.log_display.append_log(
+                f"执行用例 {self.current_row_index+1}: 从站={slave}, 功能码={func}, "
+                f"地址={addr}, 数量={quantity}, 类型={data_type}, 顺序={byte_order}",
+                "INFO"
+            )
+            
+            if is_read:
+                result = self.modbus_manager.read(
+                    slave, addr, quantity, func, data_type, byte_order
+                )
+                if result is not None:
+                    display_value = self._format_result_for_display(
+                        result, data_type, byte_order, bit_names, desc
+                    )
+                    self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem(display_value))
+                    status = "成功"
+                    self.log_display.append_log(f"✓ 用例 {self.current_row_index+1} 成功: {display_value}", "SUCCESS")
                 else:
-                    values = [int(qty)]
-                result = self.modbus_manager.write(slave, addr, values, func)
-                status = "成功" if result else "失败"
-            
-            self.table_widget.setItem(self.current_row_index, 5, QTableWidgetItem(status))
-            if status == "成功":
-                self.table_widget.item(self.current_row_index, 5).setBackground(QColor(0, 80, 0))
+                    self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem("读取失败"))
+                    status = "失败"
+                    self.log_display.append_log(f"✗ 用例 {self.current_row_index+1} 失败", "ERROR")
             else:
-                self.table_widget.item(self.current_row_index, 5).setBackground(QColor(80, 0, 0))
+                self.log_display.append_log("写入操作需要填写数据，当前用例暂不支持自动写入", "WARNING")
+                self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem("写入操作"))
+                status = "跳过"
+            
+            self.table_widget.setItem(self.current_row_index, 8, QTableWidgetItem(status))
+            if status == "成功":
+                self.table_widget.item(self.current_row_index, 8).setBackground(QColor(0, 80, 0))
+            elif status == "失败":
+                self.table_widget.item(self.current_row_index, 8).setBackground(QColor(80, 0, 0))
+            else:
+                self.table_widget.item(self.current_row_index, 8).setBackground(QColor(80, 80, 0))
+                
         except Exception as e:
             self.log_display.append_log(f"执行失败: {e}", "ERROR")
+            self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem("异常"))
+            self.table_widget.setItem(self.current_row_index, 8, QTableWidgetItem("异常"))
+            self.table_widget.item(self.current_row_index, 8).setBackground(QColor(80, 0, 80))
     
     def run_all(self):
         if self.excel_df is None or not self.modbus_manager.is_connected:
             self.log_display.append_log("请先连接并加载数据", "WARNING")
             return
-        for i in range(len(self.excel_df)):
+        success_count = 0
+        total = len(self.excel_df)
+        for i in range(total):
             self.current_row_index = i
             self.run_current_row()
+            item = self.table_widget.item(i, 8)
+            if item and item.text() == "成功":
+                success_count += 1
             QApplication.processEvents()
-        self.log_display.append_log("批量执行完成", "SUCCESS")
+        self.log_display.append_log(f"批量执行完成: 成功 {success_count}/{total}", "SUCCESS")
     
     # ---- 手动发送 ----
+    def _float_to_registers(self, val, byte_order='ABCD'):
+        """将浮点数转换为寄存器值列表"""
+        packed = struct.pack('>f', val)
+        if byte_order.upper() == 'BADC':
+            packed = bytes([packed[1], packed[0], packed[3], packed[2]])
+        elif byte_order.upper() == 'CDAB':
+            packed = bytes([packed[2], packed[3], packed[0], packed[1]])
+        elif byte_order.upper() == 'DCBA':
+            packed = bytes([packed[3], packed[2], packed[1], packed[0]])
+        
+        reg1 = (packed[0] << 8) | packed[1]
+        reg2 = (packed[2] << 8) | packed[3]
+        return [reg1, reg2]
+    
     def build_raw(self):
-        """从参数构建报文 - TCP模式不含CRC"""
         try:
             slave = self.manual_slave.value()
             func_text = self.manual_func.currentText()
@@ -831,10 +1217,15 @@ class ModbusGUI(QMainWindow):
                 return
             
             protocol = self.protocol_combo.currentText()
+            data_type = self.parse_type_combo.currentText()
+            byte_order = self.parse_order_combo.currentText()
             
-            # 构建PDU（不含CRC）
+            if ',' in qty_text:
+                raw_values = [v.strip() for v in qty_text.split(',')]
+            else:
+                raw_values = [qty_text]
+            
             if func in [1, 2, 3, 4]:
-                # 读请求
                 num = int(qty_text)
                 pdu = bytearray([
                     slave,
@@ -845,8 +1236,7 @@ class ModbusGUI(QMainWindow):
                     num & 0xFF
                 ])
             elif func == 5:
-                # 写单个线圈
-                values = [int(v.strip()) for v in qty_text.split(',')]
+                values = [int(v.strip()) for v in raw_values]
                 if not values:
                     self.log_display.append_log("请填写数据值", "WARNING")
                     return
@@ -860,22 +1250,37 @@ class ModbusGUI(QMainWindow):
                     value & 0xFF
                 ])
             elif func == 6:
-                # 写单个寄存器
-                values = [int(v.strip()) for v in qty_text.split(',')]
-                if not values:
-                    self.log_display.append_log("请填写数据值", "WARNING")
-                    return
-                pdu = bytearray([
-                    slave,
-                    func,
-                    (addr >> 8) & 0xFF,
-                    addr & 0xFF,
-                    (values[0] >> 8) & 0xFF,
-                    values[0] & 0xFF
-                ])
+                if data_type.upper() == 'FLOAT':
+                    try:
+                        self.log_display.append_log("⚠️ 功能码06只能写单个寄存器(16位)，浮点数建议使用功能码16写2个寄存器", "WARNING")
+                        val = float(raw_values[0])
+                        int_val = int(val) & 0xFFFF
+                        pdu = bytearray([
+                            slave,
+                            func,
+                            (addr >> 8) & 0xFF,
+                            addr & 0xFF,
+                            (int_val >> 8) & 0xFF,
+                            int_val & 0xFF
+                        ])
+                    except ValueError:
+                        self.log_display.append_log("数据格式错误: 请输入有效的浮点数", "ERROR")
+                        return
+                else:
+                    values = [int(v.strip()) for v in raw_values]
+                    if not values:
+                        self.log_display.append_log("请填写数据值", "WARNING")
+                        return
+                    pdu = bytearray([
+                        slave,
+                        func,
+                        (addr >> 8) & 0xFF,
+                        addr & 0xFF,
+                        (values[0] >> 8) & 0xFF,
+                        values[0] & 0xFF
+                    ])
             elif func == 15:
-                # 写多个线圈
-                values = [int(v.strip()) for v in qty_text.split(',')]
+                values = [int(v.strip()) for v in raw_values]
                 if not values:
                     self.log_display.append_log("请填写数据值", "WARNING")
                     return
@@ -898,39 +1303,66 @@ class ModbusGUI(QMainWindow):
                 ])
                 pdu.extend(data_bytes)
             elif func == 16:
-                # 写多个寄存器
-                values = [int(v.strip()) for v in qty_text.split(',')]
-                if not values:
-                    self.log_display.append_log("请填写数据值", "WARNING")
-                    return
-                byte_count = len(values) * 2
-                pdu = bytearray([
-                    slave,
-                    func,
-                    (addr >> 8) & 0xFF,
-                    addr & 0xFF,
-                    (len(values) >> 8) & 0xFF,
-                    len(values) & 0xFF,
-                    byte_count
-                ])
-                for v in values:
-                    pdu.append((v >> 8) & 0xFF)
-                    pdu.append(v & 0xFF)
+                if data_type.upper() == 'FLOAT':
+                    try:
+                        reg_values = []
+                        for v_str in raw_values:
+                            val = float(v_str)
+                            regs = self._float_to_registers(val, byte_order)
+                            reg_values.extend(regs)
+                        
+                        register_count = len(reg_values)
+                        byte_count = register_count * 2
+                        
+                        pdu = bytearray([
+                            slave,
+                            func,
+                            (addr >> 8) & 0xFF,
+                            addr & 0xFF,
+                            (register_count >> 8) & 0xFF,
+                            register_count & 0xFF,
+                            byte_count
+                        ])
+                        for reg_val in reg_values:
+                            pdu.append((reg_val >> 8) & 0xFF)
+                            pdu.append(reg_val & 0xFF)
+                        
+                        self.log_display.append_log(
+                            f"浮点数 {raw_values} 转换为寄存器值: {reg_values}",
+                            "DEBUG"
+                        )
+                    except ValueError:
+                        self.log_display.append_log("数据格式错误: 请输入有效的浮点数", "ERROR")
+                        return
+                else:
+                    values = [int(v.strip()) for v in raw_values]
+                    if not values:
+                        self.log_display.append_log("请填写数据值", "WARNING")
+                        return
+                    byte_count = len(values) * 2
+                    pdu = bytearray([
+                        slave,
+                        func,
+                        (addr >> 8) & 0xFF,
+                        addr & 0xFF,
+                        (len(values) >> 8) & 0xFF,
+                        len(values) & 0xFF,
+                        byte_count
+                    ])
+                    for v in values:
+                        pdu.append((v >> 8) & 0xFF)
+                        pdu.append(v & 0xFF)
             else:
                 self.log_display.append_log(f"不支持的功能码: {func}", "ERROR")
                 return
             
-            # 根据协议决定是否添加CRC
             if protocol == "RTU":
                 crc = calc_crc16(pdu)
                 request = pdu + crc
             else:
                 request = bytes(pdu)
             
-            # 转换为格式化的十六进制字符串
             hex_str = ' '.join([f'{b:02X}' for b in request])
-            
-            # 设置到文本框
             self.raw_hex_edit.setText(hex_str)
             self.log_display.append_log(f"构建报文: {hex_str} ({protocol})", "SUCCESS")
             
@@ -950,12 +1382,161 @@ class ModbusGUI(QMainWindow):
             
             response = self.modbus_manager.send_raw_and_receive(raw_bytes)
             if response is not None:
-                self.manual_response.setText(f"响应: {format_hex_bytes(response)}")
+                response_hex = ' '.join([f'{b:02X}' for b in response])
+                self.manual_response.setText(response_hex)
                 self.log_display.append_log("发送成功", "SUCCESS")
+                self.parse_response_data()
             else:
                 self.manual_response.setText("无响应")
         except Exception as e:
             self.log_display.append_log(f"发送失败: {e}", "ERROR")
+    
+    # ---- 数据解析 ----
+    def _parse_write_response(self, pdu, func_code):
+        try:
+            func_name = {
+                5: '写单个线圈',
+                6: '写单个寄存器',
+                15: '写多个线圈',
+                16: '写多个寄存器'
+            }.get(func_code, f'0x{func_code:02X}')
+            
+            if len(pdu) < 4:
+                return f"写入响应异常: PDU长度不足 ({len(pdu)}字节)"
+            
+            if func_code in [5, 6]:
+                addr = (pdu[1] << 8) | pdu[2]
+                value = (pdu[3] << 8) | pdu[4]
+                
+                if func_code == 5:
+                    val_display = 'ON' if value == 0xFF00 else 'OFF'
+                else:
+                    val_display = str(value)
+                
+                return (
+                    f"✓ 写入成功!\n"
+                    f"  功能码: {func_name} (0x{func_code:02X})\n"
+                    f"  地址: 0x{addr:04X} ({addr})\n"
+                    f"  写入值: {val_display}\n"
+                    f"  响应报文: {format_hex_bytes(pdu)}"
+                )
+            
+            elif func_code in [15, 16]:
+                if len(pdu) < 4:
+                    return f"写入响应异常: PDU长度不足 ({len(pdu)}字节)"
+                addr = (pdu[1] << 8) | pdu[2]
+                quantity = (pdu[3] << 8) | pdu[4]
+                
+                return (
+                    f"✓ 写入成功!\n"
+                    f"  功能码: {func_name} (0x{func_code:02X})\n"
+                    f"  起始地址: 0x{addr:04X} ({addr})\n"
+                    f"  寄存器数量: {quantity}\n"
+                    f"  响应报文: {format_hex_bytes(pdu)}"
+                )
+            else:
+                return f"未知写入功能码: 0x{func_code:02X}"
+                
+        except Exception as e:
+            return f"解析写入响应失败: {e}"
+    
+    def parse_response_data(self):
+        try:
+            response_hex = self.manual_response.text().strip()
+            if not response_hex or response_hex == "无响应":
+                self.parse_result_text.setText("无响应数据可解析")
+                return
+            
+            hex_str = response_hex.replace(' ', '').replace('\n', '')
+            response_bytes = bytes.fromhex(hex_str)
+            
+            if len(response_bytes) < 4:
+                self.parse_result_text.setText("响应数据太短，无法解析")
+                return
+            
+            is_rtu = self.protocol_combo.currentText() == "RTU"
+            pdu, info = ModbusDataParser.parse_response_full(response_bytes, is_rtu)
+            
+            if pdu is None:
+                self.parse_result_text.setText("无法解析响应报文")
+                return
+            
+            func_code = info.get('func_code', 0)
+            is_write = func_code in [5, 6, 15, 16]
+            
+            if info.get('error'):
+                self.parse_result_text.setText(
+                    f"错误响应:\n"
+                    f"  功能码: 0x{info['func_code']:02X}\n"
+                    f"  错误码: 0x{info['error_code']:02X}\n"
+                    f"  错误信息: {info['message']}"
+                )
+                return
+            
+            if is_write:
+                write_result = self._parse_write_response(pdu, func_code)
+                self.parse_result_text.setText(write_result)
+                return
+            
+            data_bytes = info.get('data_bytes', b'')
+            if not data_bytes:
+                self.parse_result_text.setText("响应中无数据")
+                return
+            
+            data_type = self.parse_type_combo.currentText()
+            byte_order = self.parse_order_combo.currentText()
+            start_index = self.parse_start.value()
+            count = self.parse_count.value()
+            
+            if data_type == 'BIT':
+                results = ModbusDataParser.parse_bit_data(
+                    data_bytes, start_index, count, byte_order
+                )
+                if results:
+                    lines = ["BIT数据解析结果:"]
+                    lines.append("=" * 50)
+                    lines.append(f"原始数据: {' '.join([f'{b:02X}' for b in data_bytes])}")
+                    lines.append("=" * 50)
+                    
+                    if len(data_bytes) == 2:
+                        if byte_order in ['BADC', 'CDAB', 'DCBA']:
+                            reg_val = (data_bytes[1] << 8) | data_bytes[0]
+                        else:
+                            reg_val = (data_bytes[0] << 8) | data_bytes[1]
+                        lines.append(f"寄存器值: 0x{reg_val:04X} ({reg_val})")
+                        lines.append("=" * 50)
+                    
+                    for r in results[:50]:
+                        lines.append(f"  位 {r['index']:3d} (字节{r['byte']} bit{r['bit']}): {r['display']}")
+                    if len(results) > 50:
+                        lines.append(f"  ... 共 {len(results)} 位")
+                    self.parse_result_text.setText('\n'.join(lines))
+                else:
+                    self.parse_result_text.setText("无BIT数据")
+            else:
+                results = ModbusDataParser.parse_register_data(
+                    data_bytes, data_type, byte_order, start_index, count
+                )
+                if results:
+                    lines = [f"{data_type}数据解析结果 (功能码0x{func_code:02X}):"]
+                    lines.append("=" * 50)
+                    lines.append(f"原始数据: {' '.join([f'{b:02X}' for b in data_bytes])}")
+                    lines.append("=" * 50)
+                    for r in results[:50]:
+                        if r.get('type') == 'BIT':
+                            lines.append(f"  寄存器 {r['register']} 位 {r['bit']:2d}: {r['display']}")
+                        else:
+                            hex_val = r.get('hex', '')
+                            lines.append(f"  索引 {r['index']:2d}: {r['display']:15s}  (HEX: {hex_val})")
+                    if len(results) > 50:
+                        lines.append(f"  ... 共 {len(results)} 个")
+                    self.parse_result_text.setText('\n'.join(lines))
+                else:
+                    self.parse_result_text.setText("无寄存器数据")
+            
+        except Exception as e:
+            self.parse_result_text.setText(f"解析失败: {e}")
+            self.log_display.append_log(f"解析错误: {e}", "ERROR")
     
     def clear_log(self):
         self.log_display.clear()
