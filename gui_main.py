@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Modbus GUI 测试工具
+Modbus GUI 测试工具 v2.0
 功能：支持批量测试（Excel驱动）和手动发送原始报文
 兼容你的 modbus_rtu.py 和 modbus_tcp.py 模块
 """
@@ -19,6 +19,7 @@ import configparser
 import pandas as pd
 from pathlib import Path
 import struct
+from typing import Optional, Dict, Any, List, Tuple
 
 # ===== 导入你的 Modbus 模块 =====
 from modbus_tcp import tcp_connect, tcp_recv
@@ -39,6 +40,90 @@ from modbus_common import (
 )
 
 
+# ===== 常量定义 =====
+ERROR_CODES = {
+    1: '非法功能码',
+    2: '非法数据地址',
+    3: '非法数据值',
+    4: '从站设备故障',
+    5: '确认',
+    6: '从站设备忙',
+    8: '存储奇偶校验错误',
+    10: '不可用网关路径',
+    11: '网关目标设备无响应'
+}
+
+# 表格列索引
+COL_CASE_ID = 0
+COL_DEVICE_ADDR = 1
+COL_FUNC_CODE = 2
+COL_ADDRESS = 3
+COL_QUANTITY = 4
+COL_DATA_TYPE = 5
+COL_BYTE_ORDER = 6
+COL_RESULT = 7
+COL_STATUS = 8
+
+
+# ===== 配置管理器 =====
+class ConfigManager:
+    """配置管理类"""
+    def __init__(self, config_path: str = 'config.ini'):
+        self.config_path = config_path
+        self.config = configparser.ConfigParser()
+        self.load()
+    
+    def load(self):
+        """加载配置文件"""
+        if os.path.exists(self.config_path):
+            self.config.read(self.config_path, encoding='utf-8')
+            self._ensure_defaults()
+        else:
+            self._create_default()
+    
+    def _ensure_defaults(self):
+        """确保必要的配置项存在"""
+        if 'tcp' not in self.config:
+            self.config['tcp'] = {'host': '127.0.0.1', 'port': '502'}
+        if 'rtu' not in self.config:
+            self.config['rtu'] = {'port': 'COM1', 'baudrate': '9600'}
+        if 'timing' not in self.config:
+            self.config['timing'] = {'timeout_sec': '3'}
+    
+    def _create_default(self):
+        """创建默认配置"""
+        self.config['tcp'] = {'host': '127.0.0.1', 'port': '502'}
+        self.config['rtu'] = {'port': 'COM1', 'baudrate': '9600'}
+        self.config['timing'] = {'timeout_sec': '3'}
+        self.save()
+    
+    def save(self):
+        """保存配置"""
+        with open(self.config_path, 'w', encoding='utf-8') as f:
+            self.config.write(f)
+    
+    def get_tcp_config(self) -> Dict[str, str]:
+        return {
+            'host': self.config.get('tcp', 'host', fallback='127.0.0.1'),
+            'port': self.config.get('tcp', 'port', fallback='502')
+        }
+    
+    def get_rtu_config(self) -> Dict[str, str]:
+        return {
+            'port': self.config.get('rtu', 'port', fallback='COM1'),
+            'baudrate': self.config.get('rtu', 'baudrate', fallback='9600')
+        }
+    
+    def get_timeout(self) -> int:
+        return self.config.getint('timing', 'timeout_sec', fallback=3)
+    
+    def set_tcp_config(self, host: str, port: str):
+        self.config['tcp'] = {'host': host, 'port': port}
+    
+    def set_rtu_config(self, port: str, baudrate: str):
+        self.config['rtu'] = {'port': port, 'baudrate': baudrate}
+
+
 # ===== 日志组件 =====
 class LogRedirector(QTextEdit):
     def __init__(self, parent=None):
@@ -57,8 +142,18 @@ class LogRedirector(QTextEdit):
             }
         """)
         self.max_lines = 10000
+        self.log_filter = "所有"
+        self._html_cache = []
         
-    def append_log(self, message, level="INFO"):
+    def set_log_filter(self, level: str):
+        """设置日志过滤器"""
+        self.log_filter = level
+        
+    def append_log(self, message: str, level: str = "INFO"):
+        """添加日志消息，支持颜色区分和过滤"""
+        if self.log_filter != "所有" and self.log_filter != level:
+            return
+        
         timestamp = datetime.now().strftime("%H:%M:%S")
         color_map = {
             "INFO": "#d4d4d4", "WARNING": "#ffcc00", "ERROR": "#ff4444",
@@ -66,19 +161,28 @@ class LogRedirector(QTextEdit):
             "RECV": "#ce9178", "RESULT": "#c586c0"
         }
         color = color_map.get(level, "#d4d4d4")
+        
         html = f'<span style="color:#808080;">[{timestamp}]</span> '
         html += f'<span style="color:{color}; font-weight:bold;">[{level}]</span> '
-        html += f'<span style="color:#d4d4d4;">{self.html_escape(message)}</span><br>'
+        html += f'<span style="color:#d4d4d4;">{self._html_escape(message)}</span><br>'
         self.append(html)
+        self._html_cache.append(html)
+        
         if self.document().blockCount() > self.max_lines:
             cursor = self.textCursor()
             cursor.movePosition(QTextCursor.Start)
             cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, 100)
             cursor.removeSelectedText()
+            self._html_cache = self._html_cache[100:]
+        
         scrollbar = self.verticalScrollBar()
         QTimer.singleShot(10, lambda: scrollbar.setValue(scrollbar.maximum()))
     
-    def html_escape(self, text):
+    def get_full_log(self) -> str:
+        """获取完整的日志文本"""
+        return self.toPlainText()
+    
+    def _html_escape(self, text: str) -> str:
         return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 
@@ -87,7 +191,8 @@ class ModbusDataParser:
     """Modbus响应数据解析器"""
     
     @staticmethod
-    def parse_bit_data(data_bytes, start_bit=0, bit_count=None, byte_order='ABCD'):
+    def parse_bit_data(data_bytes: bytes, start_bit: int = 0, bit_count: int = None, 
+                       byte_order: str = 'ABCD') -> List[Dict]:
         """解析位数据（线圈/离散输入/寄存器值的位）"""
         if not data_bytes:
             return []
@@ -120,7 +225,9 @@ class ModbusDataParser:
         return results
     
     @staticmethod
-    def parse_register_data(data_bytes, data_type='UINT16', byte_order='ABCD', start_index=0, count=None):
+    def parse_register_data(data_bytes: bytes, data_type: str = 'UINT16', 
+                            byte_order: str = 'ABCD', start_index: int = 0, 
+                            count: int = None) -> List[Dict]:
         """解析寄存器数据"""
         if not data_bytes:
             return []
@@ -205,7 +312,7 @@ class ModbusDataParser:
         return results
     
     @staticmethod
-    def parse_response_full(response_bytes, is_rtu=True):
+    def parse_response_full(response_bytes: bytes, is_rtu: bool = True) -> Tuple[Optional[bytes], Optional[Dict]]:
         """解析完整响应报文，提取PDU和数据"""
         if not response_bytes:
             return None, None
@@ -219,12 +326,7 @@ class ModbusDataParser:
             func_code = pdu[0]
             if func_code & 0x80:
                 error_code = pdu[1] if len(pdu) > 1 else 0
-                error_msg = {
-                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
-                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
-                    8: '存储奇偶校验错误', 10: '不可用网关路径',
-                    11: '网关目标设备无响应'
-                }.get(error_code, f'未知错误(0x{error_code:02X})')
+                error_msg = ERROR_CODES.get(error_code, f'未知错误(0x{error_code:02X})')
                 return pdu, {'error': True, 'func_code': func_code, 'error_code': error_code, 'message': error_msg}
             
             if func_code in [5, 6, 15, 16]:
@@ -263,12 +365,7 @@ class ModbusDataParser:
             
             if func_code & 0x80:
                 error_code = pdu[2] if len(pdu) > 2 else 0
-                error_msg = {
-                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
-                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
-                    8: '存储奇偶校验错误', 10: '不可用网关路径',
-                    11: '网关目标设备无响应'
-                }.get(error_code, f'未知错误(0x{error_code:02X})')
+                error_msg = ERROR_CODES.get(error_code, f'未知错误(0x{error_code:02X})')
                 return pdu, {'error': True, 'func_code': func_code, 'error_code': error_code, 'message': error_msg}
             
             if func_code in [5, 6, 15, 16]:
@@ -299,15 +396,16 @@ class ModbusDataParser:
 
 # ===== Modbus 管理器 =====
 class ModbusManager:
-    def __init__(self):
+    def __init__(self, timeout: int = 3):
         self.connection = None
         self.protocol = None
         self.is_connected = False
         self.connection_params = {}
-        self.timeout = 3
+        self.timeout = timeout
         self.log_callback = None
     
-    def connect_tcp(self, host='127.0.0.1', port=502):
+    # ---- 连接管理 ----
+    def connect_tcp(self, host: str = '127.0.0.1', port: int = 502) -> bool:
         try:
             port = int(port)
             sock = tcp_connect(host, port, self.timeout * 1000)
@@ -322,8 +420,8 @@ class ModbusManager:
             self._log_to_gui(f"TCP连接失败: {e}", "ERROR")
             return False
     
-    def connect_rtu(self, port='COM1', baudrate=9600, timeout_ms=3000, 
-                    data_bits=8, parity='N', stop_bits=1):
+    def connect_rtu(self, port: str = 'COM1', baudrate: int = 9600, timeout_ms: int = 3000, 
+                    data_bits: int = 8, parity: str = 'N', stop_bits: float = 1) -> bool:
         try:
             baudrate = int(baudrate)
             timeout_ms = int(timeout_ms)
@@ -364,64 +462,82 @@ class ModbusManager:
         except Exception as e:
             self._log_to_gui(f"断开失败: {e}", "ERROR")
     
-    def _send_raw(self, raw_bytes):
+    # ---- 请求构建（协议无关） ----
+    def _build_request(self, slave_id: int, function_code: int, address: int, data) -> bytes:
+        """构建请求报文（协议无关）"""
+        pdu = build_single_message(
+            addr=slave_id,
+            func=function_code,
+            start=address,
+            num=data
+        )
+        
         if self.protocol == 'tcp':
-            try:
-                self.connection.send(raw_bytes)
-                return True
-            except Exception as e:
-                self._log_to_gui(f"TCP发送失败: {e}", "ERROR")
-                return False
-        else:
-            try:
-                bytes_written = self.connection.write(raw_bytes)
-                self._log_to_gui(f"实际发送字节数: {bytes_written}", "DEBUG")
-                return True
-            except Exception as e:
-                self._log_to_gui(f"RTU发送失败: {e}", "ERROR")
-                return False
+            transaction_id = int(time.time() * 1000) % 65535
+            tcp_request = bytearray()
+            tcp_request.append((transaction_id >> 8) & 0xFF)
+            tcp_request.append(transaction_id & 0xFF)
+            tcp_request.append(0x00)
+            tcp_request.append(0x00)
+            tcp_request.append(0x00)
+            tcp_request.append(len(pdu))
+            tcp_request.extend(pdu)
+            return bytes(tcp_request)
+        return pdu
     
-    def _recv(self):
+    # ---- 响应解析（协议无关） ----
+    def _parse_response(self, response: bytes) -> Optional[Dict]:
+        """解析响应报文（协议无关）"""
+        if not response:
+            return None
+        
         if self.protocol == 'tcp':
-            try:
-                return tcp_recv(self.connection, int(self.timeout * 1000))
-            except Exception as e:
-                self._log_to_gui(f"TCP接收异常: {e}", "DEBUG")
+            if len(response) <= 6:
+                self._log_to_gui("响应太短", "ERROR")
                 return None
-        else:
-            try:
-                return rtu_recv(self.connection, int(self.timeout * 1000))
-            except Exception as e:
-                self._log_to_gui(f"RTU接收异常: {e}", "DEBUG")
+            pdu = response[6:]
+            # TCP: [单元ID] [功能码] [字节数] [数据...]
+            func_idx, byte_count_idx, data_start_idx = 1, 2, 3
+        else:  # RTU
+            if len(response) <= 3:
+                self._log_to_gui("响应太短", "ERROR")
                 return None
+            pdu = response[1:-2]
+            # RTU: [功能码] [字节数] [数据...]
+            func_idx, byte_count_idx, data_start_idx = 0, 1, 2
+        
+        if len(pdu) < 3:
+            self._log_to_gui("PDU太短", "ERROR")
+            return None
+        
+        func_code = pdu[func_idx]
+        
+        # 检查错误响应
+        if func_code & 0x80:
+            error_code = pdu[func_idx + 1] if len(pdu) > func_idx + 1 else 0
+            error_msg = ERROR_CODES.get(error_code, f'未知错误(0x{error_code:02X})')
+            self._log_to_gui(f"错误: 0x{func_code:02X} 错误码: 0x{error_code:02X} ({error_msg})", "ERROR")
+            return None
+        
+        byte_count = pdu[byte_count_idx]
+        data_bytes = pdu[data_start_idx:data_start_idx + byte_count]
+        
+        return {
+            'func_code': func_code,
+            'byte_count': byte_count,
+            'data_bytes': data_bytes,
+            'pdu': pdu
+        }
     
-    def read(self, slave_id, address, count, function_code, data_type='UINT16', byte_order='ABCD'):
+    # ---- 高层接口 ----
+    def read(self, slave_id: int, address: int, count: int, function_code: int, 
+             data_type: str = 'UINT16', byte_order: str = 'ABCD') -> Optional[List]:
         if not self.is_connected:
             self._log_to_gui("未连接设备", "WARNING")
             return None
         
         try:
-            pdu = build_single_message(
-                addr=slave_id,
-                func=function_code,
-                start=address,
-                num=count
-            )
-            
-            if self.protocol == 'tcp':
-                transaction_id = int(time.time() * 1000) % 65535
-                tcp_request = bytearray()
-                tcp_request.append((transaction_id >> 8) & 0xFF)
-                tcp_request.append(transaction_id & 0xFF)
-                tcp_request.append(0x00)
-                tcp_request.append(0x00)
-                tcp_request.append(0x00)
-                tcp_request.append(len(pdu))
-                tcp_request.extend(pdu)
-                request = bytes(tcp_request)
-            else:
-                request = pdu
-            
+            request = self._build_request(slave_id, function_code, address, count)
             self._log_to_gui(f"发送: {format_hex_bytes(request)}", "SEND")
             
             if not self._send_raw(request):
@@ -434,50 +550,11 @@ class ModbusManager:
             
             self._log_to_gui(f"接收: {format_hex_bytes(response)}", "RECV")
             
-            # 提取PDU - TCP和RTU不同
-            if self.protocol == 'tcp':
-                if len(response) > 6:
-                    pdu_response = response[6:]
-                else:
-                    self._log_to_gui("响应太短", "ERROR")
-                    return None
-                # TCP: [单元ID] [功能码] [字节数] [数据...]
-                func_idx = 1
-                byte_count_idx = 2
-                data_start_idx = 3
-            else:  # RTU
-                if len(response) > 3:
-                    pdu_response = response[1:-2]
-                else:
-                    self._log_to_gui("响应太短", "ERROR")
-                    return None
-                # RTU: [功能码] [字节数] [数据...]
-                func_idx = 0
-                byte_count_idx = 1
-                data_start_idx = 2
-            
-            if len(pdu_response) < 3:
-                self._log_to_gui("PDU太短", "ERROR")
+            parsed = self._parse_response(response)
+            if parsed is None:
                 return None
             
-            resp_func_code = pdu_response[func_idx]
-            
-            # 检查错误响应
-            if resp_func_code & 0x80:
-                error_code = pdu_response[func_idx + 1] if len(pdu_response) > func_idx + 1 else 0
-                error_msgs = {
-                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
-                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
-                    8: '存储奇偶校验错误', 10: '不可用网关路径',
-                    11: '网关目标设备无响应'
-                }
-                error_msg = error_msgs.get(error_code, f'未知错误(0x{error_code:02X})')
-                self._log_to_gui(f"错误: 0x{resp_func_code:02X} 错误码: 0x{error_code:02X} ({error_msg})", "ERROR")
-                return None
-            
-            byte_count = pdu_response[byte_count_idx]
-            data_bytes = pdu_response[data_start_idx:data_start_idx + byte_count]
-            
+            data_bytes = parsed['data_bytes']
             self._log_to_gui(f"数据字节: {format_hex_bytes(data_bytes)}", "DEBUG")
             
             if function_code in [1, 2]:
@@ -504,33 +581,13 @@ class ModbusManager:
             self._log_to_gui(f"读取失败: {e}", "ERROR")
             return None
     
-    def write(self, slave_id, address, values, function_code):
+    def write(self, slave_id: int, address: int, values, function_code: int) -> bool:
         if not self.is_connected:
             self._log_to_gui("未连接设备", "WARNING")
             return False
         
         try:
-            pdu = build_single_message(
-                addr=slave_id,
-                func=function_code,
-                start=address,
-                num=values
-            )
-            
-            if self.protocol == 'tcp':
-                transaction_id = int(time.time() * 1000) % 65535
-                tcp_request = bytearray()
-                tcp_request.append((transaction_id >> 8) & 0xFF)
-                tcp_request.append(transaction_id & 0xFF)
-                tcp_request.append(0x00)
-                tcp_request.append(0x00)
-                tcp_request.append(0x00)
-                tcp_request.append(len(pdu))
-                tcp_request.extend(pdu)
-                request = bytes(tcp_request)
-            else:
-                request = pdu
-            
+            request = self._build_request(slave_id, function_code, address, values)
             self._log_to_gui(f"写入: {format_hex_bytes(request)}", "SEND")
             
             if not self._send_raw(request):
@@ -543,43 +600,14 @@ class ModbusManager:
             
             self._log_to_gui(f"响应: {format_hex_bytes(response)}", "RECV")
             
-            if self.protocol == 'tcp':
-                if len(response) > 6:
-                    pdu_response = response[6:]
-                else:
-                    return False
-                func_idx = 1
-            else:
-                if len(response) > 3:
-                    pdu_response = response[1:-2]
-                else:
-                    return False
-                func_idx = 0
-            
-            if len(pdu_response) < 2:
-                return False
-            
-            resp_func_code = pdu_response[func_idx]
-            
-            if resp_func_code & 0x80:
-                error_code = pdu_response[func_idx + 1] if len(pdu_response) > func_idx + 1 else 0
-                error_msgs = {
-                    1: '非法功能码', 2: '非法数据地址', 3: '非法数据值',
-                    4: '从站设备故障', 5: '确认', 6: '从站设备忙',
-                    8: '存储奇偶校验错误', 10: '不可用网关路径',
-                    11: '网关目标设备无响应'
-                }
-                error_msg = error_msgs.get(error_code, f'未知错误(0x{error_code:02X})')
-                self._log_to_gui(f"错误: 0x{resp_func_code:02X} 错误码: 0x{error_code:02X} ({error_msg})", "ERROR")
-                return False
-            
-            return True
+            parsed = self._parse_response(response)
+            return parsed is not None
             
         except Exception as e:
             self._log_to_gui(f"写入失败: {e}", "ERROR")
             return False
     
-    def send_raw_and_receive(self, raw_bytes):
+    def send_raw_and_receive(self, raw_bytes: bytes) -> Optional[bytes]:
         if not self.is_connected:
             self._log_to_gui("未连接设备", "WARNING")
             return None
@@ -623,7 +651,38 @@ class ModbusManager:
             self._log_to_gui(f"收发异常: {e}", "ERROR")
             return None
     
-    def _log_to_gui(self, message, level="INFO"):
+    def _send_raw(self, raw_bytes: bytes) -> bool:
+        if self.protocol == 'tcp':
+            try:
+                self.connection.send(raw_bytes)
+                return True
+            except Exception as e:
+                self._log_to_gui(f"TCP发送失败: {e}", "ERROR")
+                return False
+        else:
+            try:
+                bytes_written = self.connection.write(raw_bytes)
+                self._log_to_gui(f"实际发送字节数: {bytes_written}", "DEBUG")
+                return True
+            except Exception as e:
+                self._log_to_gui(f"RTU发送失败: {e}", "ERROR")
+                return False
+    
+    def _recv(self) -> Optional[bytes]:
+        if self.protocol == 'tcp':
+            try:
+                return tcp_recv(self.connection, int(self.timeout * 1000))
+            except Exception as e:
+                self._log_to_gui(f"TCP接收异常: {e}", "DEBUG")
+                return None
+        else:
+            try:
+                return rtu_recv(self.connection, int(self.timeout * 1000))
+            except Exception as e:
+                self._log_to_gui(f"RTU接收异常: {e}", "DEBUG")
+                return None
+    
+    def _log_to_gui(self, message: str, level: str = "INFO"):
         if self.log_callback:
             self.log_callback(message, level)
 
@@ -632,18 +691,23 @@ class ModbusManager:
 class ModbusGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.modbus_manager = ModbusManager()
+        self.config_manager = ConfigManager()
+        self.modbus_manager = ModbusManager(self.config_manager.get_timeout())
         self.modbus_manager.log_callback = self.on_modbus_log
         self.excel_df = None
         self.current_row_index = 0
+        self.batch_index = 0
+        self.batch_success = 0
+        self.batch_total = 0
+        self.timer = None
         self.init_ui()
         self.load_config()
     
-    def on_modbus_log(self, message, level="INFO"):
+    def on_modbus_log(self, message: str, level: str = "INFO"):
         self.log_display.append_log(message, level)
     
     def init_ui(self):
-        self.setWindowTitle("Modbus GUI 测试工具")
+        self.setWindowTitle("Modbus GUI 测试工具 v2.0")
         self.setGeometry(100, 100, 1200, 900)
         self.setStyleSheet("""
             QMainWindow { background-color: #2d2d2d; }
@@ -886,6 +950,7 @@ class ModbusGUI(QMainWindow):
         log_toolbar.addWidget(QLabel("级别:"))
         self.log_level_combo = QComboBox()
         self.log_level_combo.addItems(["所有", "INFO", "SUCCESS", "WARNING", "ERROR", "SEND", "RECV"])
+        self.log_level_combo.currentTextChanged.connect(self.on_log_level_changed)
         log_toolbar.addWidget(self.log_level_combo)
         log_toolbar.addStretch()
         self.clear_log_btn = QPushButton("清空")
@@ -906,11 +971,11 @@ class ModbusGUI(QMainWindow):
         self.status_bar.showMessage("就绪")
         
         self.on_protocol_changed("TCP")
-        self.log_display.append_log("Modbus GUI 测试工具启动成功", "SUCCESS")
+        self.log_display.append_log("Modbus GUI 测试工具 v2.0 启动成功", "SUCCESS")
         self.log_display.append_log("支持BIT/UINT16/INT16/UINT32/INT32/FLOAT数据解析", "INFO")
     
     # ---- 辅助方法 ----
-    def on_protocol_changed(self, protocol):
+    def on_protocol_changed(self, protocol: str):
         if self.modbus_manager.is_connected:
             self.modbus_manager.disconnect()
             self.connect_btn.setText("连接")
@@ -918,39 +983,41 @@ class ModbusGUI(QMainWindow):
             self.send_raw_btn.setEnabled(False)
             self.run_all_btn.setEnabled(False)
             self.run_step_btn.setEnabled(False)
-            self.status_bar.showMessage("已断开")
+            self.status_bar.showMessage("已断开", 3000)
             self.log_display.append_log("协议切换，已自动断开连接", "INFO")
         
         self.protocol_stack.setCurrentIndex(0 if protocol == "TCP" else 1)
     
+    def on_log_level_changed(self, level: str):
+        self.log_display.set_log_filter(level)
+    
     def load_config(self):
         try:
-            if not os.path.exists('config.ini'):
-                return
-            config = configparser.ConfigParser()
-            config.read('config.ini', encoding='utf-8')
-            if 'tcp' in config:
-                self.ip_edit.setText(config['tcp'].get('host', '127.0.0.1'))
-                self.port_edit.setText(config['tcp'].get('port', '502'))
-            if 'rtu' in config:
-                port = config['rtu'].get('port', 'COM1')
-                idx = self.serial_combo.findText(port)
-                if idx >= 0:
-                    self.serial_combo.setCurrentIndex(idx)
-                baud = config['rtu'].get('baudrate', '9600')
-                idx = self.baudrate_combo.findText(baud)
-                if idx >= 0:
-                    self.baudrate_combo.setCurrentIndex(idx)
+            tcp_config = self.config_manager.get_tcp_config()
+            self.ip_edit.setText(tcp_config['host'])
+            self.port_edit.setText(tcp_config['port'])
+            
+            rtu_config = self.config_manager.get_rtu_config()
+            idx = self.serial_combo.findText(rtu_config['port'])
+            if idx >= 0:
+                self.serial_combo.setCurrentIndex(idx)
+            idx = self.baudrate_combo.findText(rtu_config['baudrate'])
+            if idx >= 0:
+                self.baudrate_combo.setCurrentIndex(idx)
         except Exception as e:
             pass
     
     def save_config(self):
         try:
-            config = configparser.ConfigParser()
-            config['tcp'] = {'host': self.ip_edit.text(), 'port': self.port_edit.text()}
-            config['rtu'] = {'port': self.serial_combo.currentText(), 'baudrate': self.baudrate_combo.currentText()}
-            with open('config.ini', 'w', encoding='utf-8') as f:
-                config.write(f)
+            self.config_manager.set_tcp_config(
+                self.ip_edit.text(),
+                self.port_edit.text()
+            )
+            self.config_manager.set_rtu_config(
+                self.serial_combo.currentText(),
+                self.baudrate_combo.currentText()
+            )
+            self.config_manager.save()
         except Exception as e:
             pass
     
@@ -965,6 +1032,7 @@ class ModbusGUI(QMainWindow):
                     success = self.modbus_manager.connect_tcp(ip, port)
                     if success:
                         self.log_display.append_log(f"TCP连接成功: {ip}:{port}", "SUCCESS")
+                        self.status_bar.showMessage(f"已连接 - {protocol}", 3000)
                 else:
                     port = self.serial_combo.currentText()
                     baudrate = int(self.baudrate_combo.currentText())
@@ -974,13 +1042,13 @@ class ModbusGUI(QMainWindow):
                     success = self.modbus_manager.connect_rtu(port, baudrate, 3000, data_bits, parity, stop_bits)
                     if success:
                         self.log_display.append_log(f"RTU连接成功: {port} {baudrate}", "SUCCESS")
+                        self.status_bar.showMessage(f"已连接 - {protocol}", 3000)
                 if success:
                     self.connect_btn.setText("断开")
                     self.connect_btn.setStyleSheet("QPushButton { background-color: #a1260d; }")
                     self.send_raw_btn.setEnabled(True)
                     self.run_all_btn.setEnabled(True)
                     self.run_step_btn.setEnabled(True)
-                    self.status_bar.showMessage(f"已连接 - {protocol}")
                     self.save_config()
                 else:
                     self.log_display.append_log("连接失败", "ERROR")
@@ -993,7 +1061,7 @@ class ModbusGUI(QMainWindow):
             self.send_raw_btn.setEnabled(False)
             self.run_all_btn.setEnabled(False)
             self.run_step_btn.setEnabled(False)
-            self.status_bar.showMessage("已断开")
+            self.status_bar.showMessage("已断开", 3000)
             self.log_display.append_log("已断开", "INFO")
     
     # ---- 批量测试 ----
@@ -1030,15 +1098,15 @@ class ModbusGUI(QMainWindow):
             return
         self.table_widget.setRowCount(len(self.excel_df))
         for i, row in self.excel_df.iterrows():
-            self.table_widget.setItem(i, 0, QTableWidgetItem(str(row.get('用例编号', ''))))
-            self.table_widget.setItem(i, 1, QTableWidgetItem(str(row.get('设备地址', ''))))
-            self.table_widget.setItem(i, 2, QTableWidgetItem(str(row.get('功能码', ''))))
-            self.table_widget.setItem(i, 3, QTableWidgetItem(str(row.get('起始地址', ''))))
-            self.table_widget.setItem(i, 4, QTableWidgetItem(str(row.get('寄存器数量', ''))))
-            self.table_widget.setItem(i, 5, QTableWidgetItem(str(row.get('数据类型', ''))))
-            self.table_widget.setItem(i, 6, QTableWidgetItem(str(row.get('字节顺序', ''))))
-            self.table_widget.setItem(i, 7, QTableWidgetItem(""))  # 读取结果列，初始为空
-            self.table_widget.setItem(i, 8, QTableWidgetItem("待执行"))
+            self.table_widget.setItem(i, COL_CASE_ID, QTableWidgetItem(str(row.get('用例编号', ''))))
+            self.table_widget.setItem(i, COL_DEVICE_ADDR, QTableWidgetItem(str(row.get('设备地址', ''))))
+            self.table_widget.setItem(i, COL_FUNC_CODE, QTableWidgetItem(str(row.get('功能码', ''))))
+            self.table_widget.setItem(i, COL_ADDRESS, QTableWidgetItem(str(row.get('起始地址', ''))))
+            self.table_widget.setItem(i, COL_QUANTITY, QTableWidgetItem(str(row.get('寄存器数量', ''))))
+            self.table_widget.setItem(i, COL_DATA_TYPE, QTableWidgetItem(str(row.get('数据类型', ''))))
+            self.table_widget.setItem(i, COL_BYTE_ORDER, QTableWidgetItem(str(row.get('字节顺序', ''))))
+            self.table_widget.setItem(i, COL_RESULT, QTableWidgetItem(""))
+            self.table_widget.setItem(i, COL_STATUS, QTableWidgetItem("待执行"))
         self.table_widget.resizeColumnsToContents()
     
     def next_row(self):
@@ -1053,7 +1121,8 @@ class ModbusGUI(QMainWindow):
             self.row_info_label.setText(f"第 {self.current_row_index+1}/{len(self.excel_df)} 行")
             self.table_widget.selectRow(self.current_row_index)
     
-    def _format_result_for_display(self, result, data_type, byte_order, bit_names, desc):
+    def _format_result_for_display(self, result: list, data_type: str, byte_order: str, 
+                                    bit_names: str, desc: str) -> str:
         """格式化结果用于显示 - 带描述信息，全部显示不截断"""
         if result is None:
             return "无数据"
@@ -1148,49 +1217,92 @@ class ModbusGUI(QMainWindow):
                     display_value = self._format_result_for_display(
                         result, data_type, byte_order, bit_names, desc
                     )
-                    self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem(display_value))
+                    self.table_widget.setItem(self.current_row_index, COL_RESULT, 
+                                              QTableWidgetItem(display_value))
                     status = "成功"
                     self.log_display.append_log(f"✓ 用例 {self.current_row_index+1} 成功: {display_value}", "SUCCESS")
                 else:
-                    self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem("读取失败"))
+                    self.table_widget.setItem(self.current_row_index, COL_RESULT, 
+                                              QTableWidgetItem("读取失败"))
                     status = "失败"
                     self.log_display.append_log(f"✗ 用例 {self.current_row_index+1} 失败", "ERROR")
             else:
                 self.log_display.append_log("写入操作需要填写数据，当前用例暂不支持自动写入", "WARNING")
-                self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem("写入操作"))
+                self.table_widget.setItem(self.current_row_index, COL_RESULT, 
+                                          QTableWidgetItem("写入操作"))
                 status = "跳过"
             
-            self.table_widget.setItem(self.current_row_index, 8, QTableWidgetItem(status))
-            if status == "成功":
-                self.table_widget.item(self.current_row_index, 8).setBackground(QColor(0, 80, 0))
-            elif status == "失败":
-                self.table_widget.item(self.current_row_index, 8).setBackground(QColor(80, 0, 0))
-            else:
-                self.table_widget.item(self.current_row_index, 8).setBackground(QColor(80, 80, 0))
+            self.table_widget.setItem(self.current_row_index, COL_STATUS, 
+                                      QTableWidgetItem(status))
+            self._set_status_color(self.current_row_index, status)
                 
         except Exception as e:
             self.log_display.append_log(f"执行失败: {e}", "ERROR")
-            self.table_widget.setItem(self.current_row_index, 7, QTableWidgetItem("异常"))
-            self.table_widget.setItem(self.current_row_index, 8, QTableWidgetItem("异常"))
-            self.table_widget.item(self.current_row_index, 8).setBackground(QColor(80, 0, 80))
+            self.table_widget.setItem(self.current_row_index, COL_RESULT, 
+                                      QTableWidgetItem("异常"))
+            self.table_widget.setItem(self.current_row_index, COL_STATUS, 
+                                      QTableWidgetItem("异常"))
+            self.table_widget.item(self.current_row_index, COL_STATUS).setBackground(QColor(80, 0, 80))
+    
+    def _set_status_color(self, row: int, status: str):
+        color_map = {
+            "成功": QColor(0, 80, 0),
+            "失败": QColor(80, 0, 0),
+            "跳过": QColor(80, 80, 0),
+            "待执行": QColor(30, 30, 30),
+            "异常": QColor(80, 0, 80)
+        }
+        color = color_map.get(status, QColor(30, 30, 30))
+        self.table_widget.item(row, COL_STATUS).setBackground(color)
     
     def run_all(self):
+        """异步批量执行所有用例"""
         if self.excel_df is None or not self.modbus_manager.is_connected:
             self.log_display.append_log("请先连接并加载数据", "WARNING")
             return
-        success_count = 0
-        total = len(self.excel_df)
-        for i in range(total):
-            self.current_row_index = i
-            self.run_current_row()
-            item = self.table_widget.item(i, 8)
-            if item and item.text() == "成功":
-                success_count += 1
-            QApplication.processEvents()
-        self.log_display.append_log(f"批量执行完成: 成功 {success_count}/{total}", "SUCCESS")
+        
+        self.run_all_btn.setEnabled(False)
+        self.run_step_btn.setEnabled(False)
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        
+        self.batch_index = 0
+        self.batch_success = 0
+        self.batch_total = len(self.excel_df)
+        
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._run_batch_next)
+        self.timer.start(50)
+        self.log_display.append_log(f"开始批量执行 {self.batch_total} 条用例...", "INFO")
+    
+    def _run_batch_next(self):
+        """执行下一行（定时器回调）"""
+        if self.batch_index >= self.batch_total:
+            self.timer.stop()
+            self.timer = None
+            self.run_all_btn.setEnabled(True)
+            self.run_step_btn.setEnabled(True)
+            self.prev_btn.setEnabled(True)
+            self.next_btn.setEnabled(True)
+            self.log_display.append_log(
+                f"批量执行完成: 成功 {self.batch_success}/{self.batch_total}", 
+                "SUCCESS"
+            )
+            self.status_bar.showMessage(f"批量执行完成: 成功 {self.batch_success}/{self.batch_total}", 5000)
+            return
+        
+        self.current_row_index = self.batch_index
+        self.run_current_row()
+        
+        item = self.table_widget.item(self.batch_index, COL_STATUS)
+        if item and item.text() == "成功":
+            self.batch_success += 1
+        
+        self.batch_index += 1
+        self.row_info_label.setText(f"执行中: {self.batch_index}/{self.batch_total}")
     
     # ---- 手动发送 ----
-    def _float_to_registers(self, val, byte_order='ABCD'):
+    def _float_to_registers(self, val: float, byte_order: str = 'ABCD') -> List[int]:
         """将浮点数转换为寄存器值列表"""
         packed = struct.pack('>f', val)
         if byte_order.upper() == 'BADC':
@@ -1392,7 +1504,7 @@ class ModbusGUI(QMainWindow):
             self.log_display.append_log(f"发送失败: {e}", "ERROR")
     
     # ---- 数据解析 ----
-    def _parse_write_response(self, pdu, func_code):
+    def _parse_write_response(self, pdu: bytes, func_code: int) -> str:
         try:
             func_name = {
                 5: '写单个线圈',
@@ -1544,15 +1656,18 @@ class ModbusGUI(QMainWindow):
     
     def save_log(self):
         try:
-            content = self.log_display.toPlainText()
+            content = self.log_display.get_full_log()
             if not content.strip():
+                self.log_display.append_log("没有日志可保存", "WARNING")
                 return
             filename, _ = QFileDialog.getSaveFileName(self, "保存日志", 
-                f"modbus_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", "文本文件 (*.txt)")
+                f"modbus_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt", 
+                "文本文件 (*.txt)")
             if filename:
                 with open(filename, 'w', encoding='utf-8') as f:
                     f.write(content)
                 self.log_display.append_log(f"日志已保存: {os.path.basename(filename)}", "SUCCESS")
+                self.status_bar.showMessage(f"日志已保存: {os.path.basename(filename)}", 3000)
         except Exception as e:
             self.log_display.append_log(f"保存失败: {e}", "ERROR")
     
