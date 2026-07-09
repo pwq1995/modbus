@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Modbus GUI 测试工具 v2.0
+Modbus GUI 测试工具 v2.1
 功能：支持批量测试（Excel驱动）和手动发送原始报文
+特性：RTU模式自动添加CRC校验，TCP模式自动添加MBAP头
 兼容你的 modbus_rtu.py 和 modbus_tcp.py 模块
 """
 
@@ -707,7 +708,7 @@ class ModbusGUI(QMainWindow):
         self.log_display.append_log(message, level)
     
     def init_ui(self):
-        self.setWindowTitle("Modbus GUI 测试工具 v2.0")
+        self.setWindowTitle("Modbus GUI 测试工具 v2.1")
         self.setGeometry(100, 100, 1200, 900)
         self.setStyleSheet("""
             QMainWindow { background-color: #2d2d2d; }
@@ -874,7 +875,7 @@ class ModbusGUI(QMainWindow):
         raw_group = QGroupBox("原始报文 (十六进制)")
         raw_layout = QVBoxLayout()
         self.raw_hex_edit = QTextEdit()
-        self.raw_hex_edit.setPlaceholderText("输入十六进制报文，如: 01 03 00 00 00 0A")
+        self.raw_hex_edit.setPlaceholderText("输入十六进制报文，如: 01 03 00 00 00 01 (RTU自动加CRC)")
         self.raw_hex_edit.setMaximumHeight(60)
         raw_layout.addWidget(self.raw_hex_edit)
         raw_btn_layout = QHBoxLayout()
@@ -971,8 +972,9 @@ class ModbusGUI(QMainWindow):
         self.status_bar.showMessage("就绪")
         
         self.on_protocol_changed("TCP")
-        self.log_display.append_log("Modbus GUI 测试工具 v2.0 启动成功", "SUCCESS")
+        self.log_display.append_log("Modbus GUI 测试工具 v2.1 启动成功", "SUCCESS")
         self.log_display.append_log("支持BIT/UINT16/INT16/UINT32/INT32/FLOAT数据解析", "INFO")
+        self.log_display.append_log("RTU模式自动添加CRC校验", "INFO")
     
     # ---- 辅助方法 ----
     def on_protocol_changed(self, protocol: str):
@@ -1484,6 +1486,7 @@ class ModbusGUI(QMainWindow):
             self.log_display.append_log(f"构建失败: {e}", "ERROR")
     
     def send_raw(self):
+        """发送原始报文（RTU自动CRC，TCP自动MBAP头）"""
         hex_text = self.raw_hex_edit.toPlainText().strip()
         if not hex_text:
             self.log_display.append_log("请输入报文", "WARNING")
@@ -1491,6 +1494,14 @@ class ModbusGUI(QMainWindow):
         try:
             hex_str = hex_text.replace(' ', '').replace('\n', '')
             raw_bytes = bytes.fromhex(hex_str)
+            
+            # 如果是RTU模式，自动计算CRC并附加（用户输入不含CRC）
+            if self.protocol_combo.currentText() == "RTU":
+                crc = calc_crc16(raw_bytes)
+                raw_bytes = raw_bytes + crc
+                self.log_display.append_log(f"RTU自动添加CRC: {format_hex_bytes(crc)}", "DEBUG")
+                # 更新显示报文（含CRC）
+                self.raw_hex_edit.setText(' '.join([f'{b:02X}' for b in raw_bytes]))
             
             response = self.modbus_manager.send_raw_and_receive(raw_bytes)
             if response is not None:
